@@ -10,7 +10,9 @@ use crate::payload_encoder::otlp_encoder::{lookup_obo_config, MetadataFields};
 pub use crate::payload_encoder::otlp_encoder::{OboEventConfig, OboEventMap};
 use opentelemetry_proto::tonic::trace::v1::ResourceSpans;
 use otap_df_pdata_views::views::logs::LogsDataView;
+use std::future::Future;
 use std::fmt;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info};
@@ -48,6 +50,41 @@ pub struct GenevaClientConfig {
     pub role_instance: String,
     pub msi_resource: Option<String>, // Required for Managed Identity variants
     pub obo_event_map: Option<OboEventMap>, // Per-event OBO config (None = no OBO)
+}
+
+/// Agent-fed credential source: the host agent resolves the
+/// GIG token + endpoint + moniker and supplies them here, so the uploader skips
+/// its own GCS config-service handshake. Queried per upload, so host token
+/// rotation is observed without reconstructing the client.
+pub trait AgentFedCredentialSource: Send + Sync + std::fmt::Debug {
+    /// The current credential, or `None` if the host has not provisioned one yet.
+    fn current(&self) -> Option<AgentFedCredential>;
+    /// Signal that an upload got a 401/403 with the current token, asking the host
+    /// to refresh it (the host coalesces these). The returned future completes
+    /// when the source has made its best effort to observe the refreshed token;
+    /// uploaders retry once after it resolves. Default no-op.
+    fn on_unauthorized(&self) -> AgentFedRefreshFuture<'_> {
+        Box::pin(async {})
+    }
+}
+
+/// Future returned by [`AgentFedCredentialSource::on_unauthorized`].
+pub type AgentFedRefreshFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
+/// A host-provided GIG credential snapshot (see [`AgentFedCredentialSource`]).
+#[derive(Clone, Debug)]
+pub struct AgentFedCredential {
+    /// GIG bearer token (sent as `Authorization: Bearer`).
+    pub token: String,
+    /// GIG ingestion endpoint (base URL the upload POSTs to).
+    pub endpoint: String,
+    /// Account moniker for the upload.
+    pub moniker: String,
+    /// Monitoring endpoint hint from the host. For agent-fed uploads the
+    /// `endpoint=` query parameter is normally derived from the token's
+    /// `Endpoint` claim; this value is only a fallback when that claim is
+    /// absent.
+    pub monitoring_endpoint: String,
 }
 
 /// Error type returned by [`GenevaClient::upload_batch`].
@@ -195,6 +232,62 @@ impl GenevaClient {
             target: "geneva-uploader",
             "GenevaClient initialized successfully"
         );
+
+        Ok(Self {
+            uploader: Arc::new(uploader),
+            encoder: OtlpEncoder::new(),
+            metadata_fields,
+            obo_event_map: cfg.obo_event_map,
+        })
+    }
+
+    /// Agent-fed construction: the host supplies the GIG credential via
+    /// `source`, so the uploader skips the GCS config-service handshake entirely.
+    /// `cfg.auth_method` / `cfg.msi_resource` are ignored (no `GenevaConfigClient`
+    /// is created). The source is queried per upload, so host token rotation is
+    /// observed without rebuilding the client.
+    pub fn with_agent_fed_source(
+        cfg: GenevaClientConfig,
+        source: Arc<dyn AgentFedCredentialSource>,
+    ) -> Result<Self, String> {
+        info!(
+            name: "client.new.agent_fed",
+            target: "geneva-uploader",
+            namespace = %cfg.namespace,
+            account = %cfg.account,
+            "Initializing GenevaClient (agent-fed credential source)"
+        );
+
+        let source_identity = format!(
+            "Tenant={}/Role={}/RoleInstance={}",
+            cfg.tenant, cfg.role_name, cfg.role_instance
+        );
+        let config_version = format!("Ver{}v0", cfg.config_major_version);
+        let metadata_fields = MetadataFields::new(
+            cfg.environment.clone(),
+            config_version.clone(),
+            cfg.tenant.clone(),
+            cfg.role_name.clone(),
+            cfg.role_instance.clone(),
+            cfg.namespace.clone(),
+            config_version,
+        );
+        let uploader_config = GenevaUploaderConfig {
+            namespace: metadata_fields.namespace.clone(),
+            source_identity,
+            environment: metadata_fields.env_name.clone(),
+            config_version: metadata_fields.event_version.clone(),
+        };
+
+        let uploader = GenevaUploader::from_agent_fed(source, uploader_config).map_err(|e| {
+            debug!(
+                name: "client.new.agent_fed.uploader_init",
+                target: "geneva-uploader",
+                error = %e,
+                "GenevaUploader (agent-fed) init failed"
+            );
+            format!("GenevaUploader init failed: {e}")
+        })?;
 
         Ok(Self {
             uploader: Arc::new(uploader),

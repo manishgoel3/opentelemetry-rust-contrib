@@ -1,5 +1,8 @@
-use crate::config_service::client::{GenevaConfigClient, GenevaConfigClientError};
+use crate::config_service::client::{
+    extract_endpoint_from_token, GenevaConfigClient, GenevaConfigClientError,
+};
 use crate::payload_encoder::central_blob::BatchMetadata;
+use bytes::Bytes;
 use reqwest::{header, Client};
 use serde::Deserialize;
 use serde_json::Value;
@@ -113,10 +116,19 @@ pub(crate) struct GenevaUploaderConfig {
     pub config_version: String,
 }
 
+/// Where the uploader gets the GIG credential per upload.
+#[derive(Debug, Clone)]
+pub(crate) enum IngestionSource {
+    /// Fetch from the Geneva Config Service (the default cert/MSI path).
+    ConfigClient(Arc<GenevaConfigClient>),
+    /// Use a agent-fed credential (agent-fed path); no GCS handshake.
+    AgentFed(Arc<dyn crate::client::AgentFedCredentialSource>),
+}
+
 /// Client for uploading data to Geneva Ingestion Gateway (GIG)
 #[derive(Debug, Clone)]
 pub(crate) struct GenevaUploader {
-    pub(crate) config_client: Arc<GenevaConfigClient>,
+    pub(crate) source: IngestionSource,
     pub(crate) config: GenevaUploaderConfig,
     pub(crate) http_client: Client,
 }
@@ -143,7 +155,28 @@ impl GenevaUploader {
         let client = Self::build_h1_client(headers)?;
 
         Ok(Self {
-            config_client,
+            source: IngestionSource::ConfigClient(config_client),
+            config: uploader_config,
+            http_client: client,
+        })
+    }
+
+    /// Constructs a GenevaUploader from a agent-fed credential source.
+    /// No `GenevaConfigClient` is created; `source` is queried per upload.
+    #[allow(dead_code)]
+    pub(crate) fn from_agent_fed(
+        source: Arc<dyn crate::client::AgentFedCredentialSource>,
+        uploader_config: GenevaUploaderConfig,
+    ) -> Result<Self> {
+        let mut headers = header::HeaderMap::new();
+        headers.insert(
+            header::ACCEPT,
+            header::HeaderValue::from_static("application/json"),
+        );
+        let client = Self::build_h1_client(headers)?;
+
+        Ok(Self {
+            source: IngestionSource::AgentFed(source),
             config: uploader_config,
             http_client: client,
         })
@@ -252,91 +285,149 @@ impl GenevaUploader {
             "Starting upload"
         );
 
-        // Always get fresh auth info
-        let (auth_info, moniker_info, monitoring_endpoint) =
-            self.config_client.get_ingestion_info().await?;
-        let data_size = data.len();
-        let upload_uri = self.create_upload_uri(
-            &monitoring_endpoint,
-            &moniker_info.name,
-            data_size,
-            event_name,
-            metadata,
-            row_count,
-            obo_config,
-        )?;
-        let full_url = format!(
-            "{}/{}",
-            auth_info.endpoint.trim_end_matches('/'),
-            upload_uri
-        );
-
-        debug!(
-            name: "uploader.upload.post",
-            target: "geneva-uploader",
-            event_name = %event_name,
-            moniker = %moniker_info.name,
-            "Posting to ingestion gateway"
-        );
-
-        // Send the upload request
-        let response = self
-            .http_client
-            .post(&full_url)
-            .header(
-                header::AUTHORIZATION,
-                format!("Bearer {}", auth_info.auth_token),
-            )
-            .body(data)
-            .send()
-            .await?;
-        let status = response.status();
-        // TODO: Only the delay-seconds form of Retry-After is parsed here.
-        // The HTTP-date form (e.g., "Fri, 31 Dec 2027 23:59:59 GMT") is
-        // silently ignored and results in None. Add support if the ingestion
-        // backend ever uses that form.
-        let retry_after = response
-            .headers()
-            .get(header::RETRY_AFTER)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<u64>().ok())
-            .map(Duration::from_secs);
-        let body = response.text().await?;
-
-        if status == reqwest::StatusCode::ACCEPTED {
-            let ingest_response: IngestionResponse = serde_json::from_str(&body).map_err(|e| {
-                debug!(
-                    name: "uploader.upload.parse_error",
-                    target: "geneva-uploader",
-                    error = %e,
-                    "Failed to parse ingestion response"
-                );
-                GenevaUploaderError::SerdeJson(e)
-            })?;
-
-            debug!(
-                name: "uploader.upload.success",
-                target: "geneva-uploader",
-                event_name = %event_name,
-                ticket = %ingest_response.ticket,
-                "Upload successful"
+        let data = Bytes::from(data);
+        let mut retry_after_refresh = true;
+        loop {
+            // Always get fresh credential info (agent-fed sources reflect rotation).
+            let (auth_token, gig_endpoint, moniker, monitoring_endpoint) = match &self.source {
+                IngestionSource::ConfigClient(config_client) => {
+                    let (auth_info, moniker_info, monitoring_endpoint) =
+                        config_client.get_ingestion_info().await?;
+                    (
+                        auth_info.auth_token,
+                        auth_info.endpoint,
+                        moniker_info.name,
+                        monitoring_endpoint,
+                    )
+                }
+                IngestionSource::AgentFed(source) => {
+                    let cred = source.current().ok_or_else(|| {
+                        GenevaUploaderError::ConfigClient(
+                            "agent-fed credential not yet provisioned by host".to_string(),
+                        )
+                    })?;
+                    // The GIG ingestion gateway rejects the upload (HTTP 403,
+                    // "Token must have 'Endpoint' claim set to ...") unless the
+                    // request's `endpoint` query parameter matches the `Endpoint`
+                    // claim embedded in the auth token. The native GCS config-service
+                    // path derives that value from the token itself (see
+                    // get_ingestion_info -> extract_endpoint_from_token), so the
+                    // agent-fed path must do the same. The host-supplied monitoring
+                    // endpoint is a different value (the QOS/telemetry endpoint) and
+                    // must NOT be used here. Fall back to the host-supplied value
+                    // (then the data endpoint) only if the token omits the claim.
+                    let monitoring_endpoint =
+                        extract_endpoint_from_token(&cred.token).unwrap_or_else(|_| {
+                            if cred.monitoring_endpoint.is_empty() {
+                                cred.endpoint.clone()
+                            } else {
+                                cred.monitoring_endpoint.clone()
+                            }
+                        });
+                    (
+                        cred.token,
+                        cred.endpoint,
+                        cred.moniker,
+                        monitoring_endpoint,
+                    )
+                }
+            };
+            let data_size = data.len();
+            let upload_uri = self.create_upload_uri(
+                &monitoring_endpoint,
+                &moniker,
+                data_size,
+                event_name,
+                metadata,
+                row_count,
+                obo_config,
+            )?;
+            let full_url = format!(
+                "{}/{}",
+                gig_endpoint.trim_end_matches('/'),
+                upload_uri
             );
 
-            Ok(ingest_response)
-        } else {
             debug!(
+                name: "uploader.upload.post",
+                target: "geneva-uploader",
+                event_name = %event_name,
+                moniker = %moniker,
+                "Posting to ingestion gateway"
+            );
+
+            let response = self
+                .http_client
+                .post(&full_url)
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {auth_token}"),
+                )
+                .body(data.clone())
+                .send()
+                .await?;
+            let status = response.status();
+
+            // TODO: Only the delay-seconds form of Retry-After is parsed here.
+            // The HTTP-date form (e.g., "Fri, 31 Dec 2027 23:59:59 GMT") is
+            // silently ignored and results in None. Add support if the ingestion
+            // backend ever uses that form.
+            let retry_after = response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(Duration::from_secs);
+            let body = response.text().await?;
+
+            if status == reqwest::StatusCode::ACCEPTED {
+                let ingest_response: IngestionResponse = serde_json::from_str(&body).map_err(|e| {
+                    debug!(
+                        name: "uploader.upload.parse_error",
+                        target: "geneva-uploader",
+                        error = %e,
+                        "Failed to parse ingestion response"
+                    );
+                    GenevaUploaderError::SerdeJson(e)
+                })?;
+
+                debug!(
+                    name: "uploader.upload.success",
+                    target: "geneva-uploader",
+                    event_name = %event_name,
+                    ticket = %ingest_response.ticket,
+                    "Upload successful"
+                );
+
+                return Ok(ingest_response);
+            }
+
+            if retry_after_refresh
+                && (status == reqwest::StatusCode::UNAUTHORIZED
+                    || status == reqwest::StatusCode::FORBIDDEN)
+            {
+                if let IngestionSource::AgentFed(source) = &self.source {
+                    retry_after_refresh = false;
+                    source.on_unauthorized().await;
+                    continue;
+                }
+            }
+
+            tracing::warn!(
                 name: "uploader.upload.failed",
                 target: "geneva-uploader",
                 event_name = %event_name,
                 status = status.as_u16(),
+                moniker = %moniker,
+                url = %full_url,
                 body = %body,
                 "Upload failed"
             );
-            Err(GenevaUploaderError::UploadFailed {
+            return Err(GenevaUploaderError::UploadFailed {
                 status: status.as_u16(),
                 retry_after,
                 message: body,
-            })
+            });
         }
     }
 }
@@ -377,7 +468,7 @@ mod tests {
                 .expect("Config client should init"),
         );
         GenevaUploader {
-            config_client,
+            source: IngestionSource::ConfigClient(config_client),
             config: uploader_config,
             http_client,
         }
@@ -480,6 +571,238 @@ mod tests {
         assert!(
             !uri.contains("onbehalfannotations"),
             "URI should NOT contain onbehalfannotations"
+        );
+    }
+
+    // ── Agent-fed upload path ────────────────────────────────────────────
+    // These exercise the full uploader wire path against a local mock GIG: the
+    // agent-fed token must land in the `Authorization: Bearer` header, the GCS
+    // config-service handshake must be skipped, and token rotation must be
+    // observed per upload.
+
+    #[derive(Debug)]
+    struct TestAgentFedSource {
+        token: std::sync::Mutex<String>,
+        refresh_token: std::sync::Mutex<Option<String>>,
+        endpoint: String,
+        moniker: String,
+        monitoring_endpoint: String,
+        unauthorized_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl TestAgentFedSource {
+        fn new(token: &str, endpoint: &str, moniker: &str, monitoring_endpoint: &str) -> Self {
+            Self {
+                token: std::sync::Mutex::new(token.to_string()),
+                refresh_token: std::sync::Mutex::new(None),
+                endpoint: endpoint.to_string(),
+                moniker: moniker.to_string(),
+                monitoring_endpoint: monitoring_endpoint.to_string(),
+                unauthorized_calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn set_token(&self, token: &str) {
+            *self.token.lock().unwrap() = token.to_string();
+        }
+        fn set_refresh_token(&self, token: &str) {
+            *self.refresh_token.lock().unwrap() = Some(token.to_string());
+        }
+        fn unauthorized_count(&self) -> usize {
+            self.unauthorized_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl crate::client::AgentFedCredentialSource for TestAgentFedSource {
+        fn current(&self) -> Option<crate::client::AgentFedCredential> {
+            Some(crate::client::AgentFedCredential {
+                token: self.token.lock().unwrap().clone(),
+                endpoint: self.endpoint.clone(),
+                moniker: self.moniker.clone(),
+                monitoring_endpoint: self.monitoring_endpoint.clone(),
+            })
+        }
+        fn on_unauthorized(&self) -> crate::client::AgentFedRefreshFuture<'_> {
+            Box::pin(async move {
+                self.unauthorized_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let refresh_token = self.refresh_token.lock().unwrap().clone();
+                if let Some(token) = refresh_token {
+                    self.set_token(&token);
+                }
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct EmptyAgentFedSource;
+    impl crate::client::AgentFedCredentialSource for EmptyAgentFedSource {
+        fn current(&self) -> Option<crate::client::AgentFedCredential> {
+            None
+        }
+    }
+
+    fn agent_fed_uploader(
+        source: Arc<dyn crate::client::AgentFedCredentialSource>,
+    ) -> GenevaUploader {
+        let uploader_config = GenevaUploaderConfig {
+            namespace: "TestNamespace".to_string(),
+            source_identity: "Tenant=Test/Role=R/RoleInstance=I".to_string(),
+            environment: "TestEnv".to_string(),
+            config_version: "Ver2v0".to_string(),
+        };
+        GenevaUploader::from_agent_fed(source, uploader_config).expect("agent-fed uploader builds")
+    }
+
+    #[tokio::test]
+    async fn agent_fed_upload_uses_host_token_and_skips_gcs() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        // The GCS config-service is intentionally NOT mocked. If the agent-fed
+        // path attempted the handshake it would fail; a 202 here proves it was
+        // skipped and the host-supplied token was used directly.
+        Mock::given(method("POST"))
+            .and(path("/api/v1/ingestion/ingest"))
+            .and(header("authorization", "Bearer host-token-AAA"))
+            .respond_with(ResponseTemplate::new(202).set_body_string(r#"{"ticket":"t-1"}"#))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let source = Arc::new(TestAgentFedSource::new(
+            "host-token-AAA",
+            &mock_server.uri(),
+            "test-moniker",
+            &mock_server.uri(),
+        ));
+        let uploader = agent_fed_uploader(source);
+        let metadata = make_test_metadata();
+
+        let resp = uploader.upload(vec![1, 2, 3], "Log", &metadata, 1, None).await;
+        assert!(resp.is_ok(), "agent-fed upload should succeed: {resp:?}");
+        // mock_server drop verifies exactly one POST carrying `Bearer host-token-AAA`.
+    }
+
+    #[tokio::test]
+    async fn agent_fed_upload_reflects_token_rotation() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/ingestion/ingest"))
+            .and(header("authorization", "Bearer tok-A"))
+            .respond_with(ResponseTemplate::new(202).set_body_string(r#"{"ticket":"a"}"#))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/ingestion/ingest"))
+            .and(header("authorization", "Bearer tok-B"))
+            .respond_with(ResponseTemplate::new(202).set_body_string(r#"{"ticket":"b"}"#))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let source = Arc::new(TestAgentFedSource::new(
+            "tok-A",
+            &mock_server.uri(),
+            "m",
+            &mock_server.uri(),
+        ));
+        let uploader = agent_fed_uploader(source.clone());
+        let metadata = make_test_metadata();
+
+        uploader.upload(vec![1], "Log", &metadata, 1, None).await.expect("upload A");
+        // Host rotates the credential; the next upload must use the new token.
+        source.set_token("tok-B");
+        uploader.upload(vec![2], "Log", &metadata, 1, None).await.expect("upload B");
+        // Both `.expect(1)` mocks verify each token was used exactly once.
+    }
+
+    #[tokio::test]
+    async fn agent_fed_upload_errors_when_not_provisioned() {
+        let uploader = agent_fed_uploader(Arc::new(EmptyAgentFedSource));
+        let metadata = make_test_metadata();
+        let resp = uploader.upload(vec![1], "Log", &metadata, 1, None).await;
+        assert!(
+            resp.is_err(),
+            "upload must error when the host has not provisioned a credential"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_fed_upload_signals_on_401() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // A 401 from GIG must invoke the source's on_unauthorized (the host
+        // refresh signal), so a later retry can use a fresh token.
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/ingestion/ingest"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("unauthorized"))
+            .expect(2)
+            .mount(&mock_server)
+            .await;
+
+        let source = Arc::new(TestAgentFedSource::new(
+            "stale-token",
+            &mock_server.uri(),
+            "m",
+            &mock_server.uri(),
+        ));
+        let uploader = agent_fed_uploader(source.clone());
+        let metadata = make_test_metadata();
+
+        let resp = uploader.upload(vec![1], "Log", &metadata, 1, None).await;
+        assert!(resp.is_err(), "a 401 upload returns an error");
+        assert_eq!(
+            source.unauthorized_count(),
+            1,
+            "a 401 must signal on_unauthorized to the host"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_fed_upload_retries_after_refresh_on_401() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/ingestion/ingest"))
+            .and(header("authorization", "Bearer stale-token"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("unauthorized"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/ingestion/ingest"))
+            .and(header("authorization", "Bearer fresh-token"))
+            .respond_with(ResponseTemplate::new(202).set_body_string(r#"{"ticket":"fresh"}"#))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let source = Arc::new(TestAgentFedSource::new(
+            "stale-token",
+            &mock_server.uri(),
+            "m",
+            &mock_server.uri(),
+        ));
+        source.set_refresh_token("fresh-token");
+        let uploader = agent_fed_uploader(source.clone());
+        let metadata = make_test_metadata();
+
+        let resp = uploader.upload(vec![1], "Log", &metadata, 1, None).await;
+        assert!(resp.is_ok(), "upload should retry with refreshed token: {resp:?}");
+        assert_eq!(
+            source.unauthorized_count(),
+            1,
+            "a single 401 should trigger one refresh before retry"
         );
     }
 }
