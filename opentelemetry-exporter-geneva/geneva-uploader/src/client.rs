@@ -10,8 +10,8 @@ use crate::payload_encoder::otlp_encoder::{lookup_obo_config, MetadataFields};
 pub use crate::payload_encoder::otlp_encoder::{OboEventConfig, OboEventMap};
 use opentelemetry_proto::tonic::trace::v1::ResourceSpans;
 use otap_df_pdata_views::views::logs::LogsDataView;
-use std::future::Future;
 use std::fmt;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -58,7 +58,14 @@ pub struct GenevaClientConfig {
 /// rotation is observed without reconstructing the client.
 pub trait AgentFedCredentialSource: Send + Sync + std::fmt::Debug {
     /// The current credential, or `None` if the host has not provisioned one yet.
-    fn current(&self) -> Option<AgentFedCredential>;
+    ///
+    /// Async so an agent-fed source can resolve the token through an awaitable
+    /// capability (e.g. otap's `bearer_token_provider`, whose `get_token` may
+    /// perform a credential call on a cache miss) by awaiting it, rather than
+    /// polling the future once and dropping it if it is not immediately ready.
+    /// Returning a boxed future (instead of `async fn`) keeps the trait
+    /// object-safe for `Arc<dyn AgentFedCredentialSource>`.
+    fn current(&self) -> AgentFedCredentialFuture<'_>;
     /// Signal that an upload got a 401/403 with the current token, asking the host
     /// to refresh it (the host coalesces these). The returned future completes
     /// when the source has made its best effort to observe the refreshed token;
@@ -68,11 +75,15 @@ pub trait AgentFedCredentialSource: Send + Sync + std::fmt::Debug {
     }
 }
 
+/// Future returned by [`AgentFedCredentialSource::current`].
+pub type AgentFedCredentialFuture<'a> =
+    Pin<Box<dyn Future<Output = Option<AgentFedCredential>> + Send + 'a>>;
+
 /// Future returned by [`AgentFedCredentialSource::on_unauthorized`].
 pub type AgentFedRefreshFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
 /// A host-provided GIG credential snapshot (see [`AgentFedCredentialSource`]).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct AgentFedCredential {
     /// GIG bearer token (sent as `Authorization: Bearer`).
     pub token: String,
@@ -85,6 +96,18 @@ pub struct AgentFedCredential {
     /// `Endpoint` claim; this value is only a fallback when that claim is
     /// absent.
     pub monitoring_endpoint: String,
+}
+
+impl std::fmt::Debug for AgentFedCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Redact the bearer token; expose only the non-secret routing fields.
+        f.debug_struct("AgentFedCredential")
+            .field("token", &"<redacted>")
+            .field("endpoint", &self.endpoint)
+            .field("moniker", &self.moniker)
+            .field("monitoring_endpoint", &self.monitoring_endpoint)
+            .finish()
+    }
 }
 
 /// Error type returned by [`GenevaClient::upload_batch`].

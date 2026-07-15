@@ -18,6 +18,8 @@ pub(crate) use ingestion_service::uploader::{
 };
 
 pub use client::EncodedBatch;
-pub use client::{AgentFedCredential, AgentFedCredentialSource, AgentFedRefreshFuture};
+pub use client::{
+    AgentFedCredential, AgentFedCredentialFuture, AgentFedCredentialSource, AgentFedRefreshFuture,
+};
 pub use client::{GenevaClient, GenevaClientConfig, UploadError};
 pub use config_service::client::AuthMethod;

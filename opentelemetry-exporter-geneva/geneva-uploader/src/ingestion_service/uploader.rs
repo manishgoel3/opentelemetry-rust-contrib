@@ -121,7 +121,7 @@ pub(crate) struct GenevaUploaderConfig {
 pub(crate) enum IngestionSource {
     /// Fetch from the Geneva Config Service (the default cert/MSI path).
     ConfigClient(Arc<GenevaConfigClient>),
-    /// Use a agent-fed credential (agent-fed path); no GCS handshake.
+    /// Use an agent-fed credential; no GCS handshake.
     AgentFed(Arc<dyn crate::client::AgentFedCredentialSource>),
 }
 
@@ -161,9 +161,8 @@ impl GenevaUploader {
         })
     }
 
-    /// Constructs a GenevaUploader from a agent-fed credential source.
+    /// Constructs a GenevaUploader from an agent-fed credential source.
     /// No `GenevaConfigClient` is created; `source` is queried per upload.
-    #[allow(dead_code)]
     pub(crate) fn from_agent_fed(
         source: Arc<dyn crate::client::AgentFedCredentialSource>,
         uploader_config: GenevaUploaderConfig,
@@ -196,7 +195,7 @@ impl GenevaUploader {
     #[allow(clippy::too_many_arguments)]
     fn create_upload_uri(
         &self,
-        monitoring_endpoint: &str,
+        endpoint_query_param: &str,
         moniker: &str,
         data_size: usize,
         event_name: &str,
@@ -211,8 +210,8 @@ impl GenevaUploader {
 
         // URL encode parameters
         // TODO - Maintain this as url-encoded in config service to avoid conversion here
-        let encoded_monitoring_endpoint: String =
-            byte_serialize(monitoring_endpoint.as_bytes()).collect();
+        let encoded_endpoint_query_param: String =
+            byte_serialize(endpoint_query_param.as_bytes()).collect();
         let encoded_source_identity: String =
             byte_serialize(self.config.source_identity.as_bytes()).collect();
 
@@ -222,7 +221,7 @@ impl GenevaUploader {
         // Create the query string
         let mut query = String::with_capacity(512); // Preallocate enough space for the query string (decided based on expected size)
         write!(&mut query, "api/v1/ingestion/ingest?endpoint={}&moniker={}&namespace={}&event={}&version={}&sourceUniqueId={}&sourceIdentity={}&startTime={}&endTime={}&format=centralbond/lz4hc&dataSize={}&minLevel={}&schemaIds={}&rowCount={}",
-            encoded_monitoring_endpoint,
+            encoded_endpoint_query_param,
             moniker,
             self.config.namespace,
             event_name,
@@ -288,8 +287,10 @@ impl GenevaUploader {
         let data = Bytes::from(data);
         let mut retry_after_refresh = true;
         loop {
-            // Always get fresh credential info (agent-fed sources reflect rotation).
-            let (auth_token, gig_endpoint, moniker, monitoring_endpoint) = match &self.source {
+            // Fresh per attempt so agent-fed rotation is observed.
+            // `endpoint_query_param` becomes the `endpoint=` query param (see
+            // `create_upload_uri`).
+            let (auth_token, gig_endpoint, moniker, endpoint_query_param) = match &self.source {
                 IngestionSource::ConfigClient(config_client) => {
                     let (auth_info, moniker_info, monitoring_endpoint) =
                         config_client.get_ingestion_info().await?;
@@ -301,7 +302,7 @@ impl GenevaUploader {
                     )
                 }
                 IngestionSource::AgentFed(source) => {
-                    let cred = source.current().ok_or_else(|| {
+                    let cred = source.current().await.ok_or_else(|| {
                         GenevaUploaderError::ConfigClient(
                             "agent-fed credential not yet provisioned by host".to_string(),
                         )
@@ -316,8 +317,8 @@ impl GenevaUploader {
                     // endpoint is a different value (the QOS/telemetry endpoint) and
                     // must NOT be used here. Fall back to the host-supplied value
                     // (then the data endpoint) only if the token omits the claim.
-                    let monitoring_endpoint =
-                        extract_endpoint_from_token(&cred.token).unwrap_or_else(|_| {
+                    let endpoint_query_param = extract_endpoint_from_token(&cred.token)
+                        .unwrap_or_else(|_| {
                             if cred.monitoring_endpoint.is_empty() {
                                 cred.endpoint.clone()
                             } else {
@@ -328,13 +329,13 @@ impl GenevaUploader {
                         cred.token,
                         cred.endpoint,
                         cred.moniker,
-                        monitoring_endpoint,
+                        endpoint_query_param,
                     )
                 }
             };
             let data_size = data.len();
             let upload_uri = self.create_upload_uri(
-                &monitoring_endpoint,
+                &endpoint_query_param,
                 &moniker,
                 data_size,
                 event_name,
@@ -342,11 +343,7 @@ impl GenevaUploader {
                 row_count,
                 obo_config,
             )?;
-            let full_url = format!(
-                "{}/{}",
-                gig_endpoint.trim_end_matches('/'),
-                upload_uri
-            );
+            let full_url = format!("{}/{}", gig_endpoint.trim_end_matches('/'), upload_uri);
 
             debug!(
                 name: "uploader.upload.post",
@@ -359,10 +356,7 @@ impl GenevaUploader {
             let response = self
                 .http_client
                 .post(&full_url)
-                .header(
-                    header::AUTHORIZATION,
-                    format!("Bearer {auth_token}"),
-                )
+                .header(header::AUTHORIZATION, format!("Bearer {auth_token}"))
                 .body(data.clone())
                 .send()
                 .await?;
@@ -381,15 +375,16 @@ impl GenevaUploader {
             let body = response.text().await?;
 
             if status == reqwest::StatusCode::ACCEPTED {
-                let ingest_response: IngestionResponse = serde_json::from_str(&body).map_err(|e| {
-                    debug!(
-                        name: "uploader.upload.parse_error",
-                        target: "geneva-uploader",
-                        error = %e,
-                        "Failed to parse ingestion response"
-                    );
-                    GenevaUploaderError::SerdeJson(e)
-                })?;
+                let ingest_response: IngestionResponse =
+                    serde_json::from_str(&body).map_err(|e| {
+                        debug!(
+                            name: "uploader.upload.parse_error",
+                            target: "geneva-uploader",
+                            error = %e,
+                            "Failed to parse ingestion response"
+                        );
+                        GenevaUploaderError::SerdeJson(e)
+                    })?;
 
                 debug!(
                     name: "uploader.upload.success",
@@ -409,6 +404,13 @@ impl GenevaUploader {
                 if let IngestionSource::AgentFed(source) = &self.source {
                     retry_after_refresh = false;
                     source.on_unauthorized().await;
+                    // Respect server backoff before the single retry, capped so
+                    // an oversized `Retry-After` can't stall the upload arbitrarily.
+                    if let Some(delay) = retry_after {
+                        const MAX_RETRY_AFTER: std::time::Duration =
+                            std::time::Duration::from_secs(30);
+                        tokio::time::sleep(delay.min(MAX_RETRY_AFTER)).await;
+                    }
                     continue;
                 }
             }
@@ -614,13 +616,14 @@ mod tests {
     }
 
     impl crate::client::AgentFedCredentialSource for TestAgentFedSource {
-        fn current(&self) -> Option<crate::client::AgentFedCredential> {
-            Some(crate::client::AgentFedCredential {
+        fn current(&self) -> crate::client::AgentFedCredentialFuture<'_> {
+            let cred = crate::client::AgentFedCredential {
                 token: self.token.lock().unwrap().clone(),
                 endpoint: self.endpoint.clone(),
                 moniker: self.moniker.clone(),
                 monitoring_endpoint: self.monitoring_endpoint.clone(),
-            })
+            };
+            Box::pin(async move { Some(cred) })
         }
         fn on_unauthorized(&self) -> crate::client::AgentFedRefreshFuture<'_> {
             Box::pin(async move {
@@ -637,8 +640,8 @@ mod tests {
     #[derive(Debug)]
     struct EmptyAgentFedSource;
     impl crate::client::AgentFedCredentialSource for EmptyAgentFedSource {
-        fn current(&self) -> Option<crate::client::AgentFedCredential> {
-            None
+        fn current(&self) -> crate::client::AgentFedCredentialFuture<'_> {
+            Box::pin(async { None })
         }
     }
 
@@ -680,7 +683,9 @@ mod tests {
         let uploader = agent_fed_uploader(source);
         let metadata = make_test_metadata();
 
-        let resp = uploader.upload(vec![1, 2, 3], "Log", &metadata, 1, None).await;
+        let resp = uploader
+            .upload(vec![1, 2, 3], "Log", &metadata, 1, None)
+            .await;
         assert!(resp.is_ok(), "agent-fed upload should succeed: {resp:?}");
         // mock_server drop verifies exactly one POST carrying `Bearer host-token-AAA`.
     }
@@ -715,10 +720,16 @@ mod tests {
         let uploader = agent_fed_uploader(source.clone());
         let metadata = make_test_metadata();
 
-        uploader.upload(vec![1], "Log", &metadata, 1, None).await.expect("upload A");
+        uploader
+            .upload(vec![1], "Log", &metadata, 1, None)
+            .await
+            .expect("upload A");
         // Host rotates the credential; the next upload must use the new token.
         source.set_token("tok-B");
-        uploader.upload(vec![2], "Log", &metadata, 1, None).await.expect("upload B");
+        uploader
+            .upload(vec![2], "Log", &metadata, 1, None)
+            .await
+            .expect("upload B");
         // Both `.expect(1)` mocks verify each token was used exactly once.
     }
 
@@ -798,7 +809,10 @@ mod tests {
         let metadata = make_test_metadata();
 
         let resp = uploader.upload(vec![1], "Log", &metadata, 1, None).await;
-        assert!(resp.is_ok(), "upload should retry with refreshed token: {resp:?}");
+        assert!(
+            resp.is_ok(),
+            "upload should retry with refreshed token: {resp:?}"
+        );
         assert_eq!(
             source.unauthorized_count(),
             1,
